@@ -1,0 +1,581 @@
+---
+title: "Antibiotics resistance genes from metagenomics data"
+author: "Chunyu Zhao"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+header-includes:
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+output:
+  pdf_document:
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+geometry: "left=2cm,right=2cm,top=2cm,bottom=2cm"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dpi=100,
+  fig.align = "center",
+  fig.width = 8,
+  cache.lazy = FALSE,
+  dev=c("png", "pdf"),
+  warning=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(readr)
+library(reshape2)
+library(ggbeeswarm)
+library(scales)
+library(stringr)
+library(RColorBrewer)
+library(viridis)
+library(pander)
+library(magrittr)
+library(forcats)
+library(ggbeeswarm)
+library(ggsci)
+library(scales)
+library(broom)
+
+library(gridExtra)
+library(grid)
+
+library(pheatmap)
+
+source("new_helper.R")
+```
+
+# Dynamic Data
+
+## metadata
+
+```{r}
+yue <- read_delim("20180926_medications_Rdata/20181009_yue_final_clean_with_medication_addAC.txt", delim="\t") %>%
+  filter(input >= 1e6)
+```
+
+## shortbred
+
+I built the ShortBRED database for CARD homology (20180628), and quantify the abundance of the ARGenes in each sample.
+
+```{r}
+filter_low_coverage <- function(props, perc_cutoff){
+  frac_nonzero <- function (x) sum(x > 0) / length(x)
+  apply(props, 1, frac_nonzero) >= perc_cutoff
+}
+
+read_sb <- function(filepath){
+  sample_id <- sub("*.sb", "", basename(filepath))
+  
+  sb <- read_delim(filepath, delim="\t", col_names = T)
+  
+  if (nrow(sb) == 0){
+    print(paste("WHAT... WHY... empty blastx search for", sample_id))
+    return(data.frame(Family=""))
+  }
+  
+  sb
+}
+
+df_2_mat <- function(df, col1){
+  rowname <- df[[col1]]
+  df <- df[,-1] %>% as.matrix()
+  rownames(df) <- rowname
+  
+  df
+}
+```
+
+```{r}
+sunbeam_output_dir <- "sunbeam_output_20180924/"
+shortbred_dir <- file.path(sunbeam_output_dir, "sbx_shortbred")
+suffix_pattern <- "*.sb"
+
+card.sb <- data_frame(FileName = list.files(shortbred_dir, pattern=suffix_pattern)) %>%
+  group_by(FileName) %>%
+  do(read_sb(file.path(shortbred_dir, .$FileName))) %>%
+  ungroup() %>%
+  mutate(SampleID = sub(suffix_pattern, "", FileName)) %>%
+  select(SampleID, everything()) %>%
+  select(-FileName) %>%
+  as.data.frame()
+
+#setdiff(yue$SampleIDNew, card.sb$SampleID)
+
+##### here we only consider activate coltis subgroup
+card.sb %<>%
+  filter(SampleID %in% yue$SampleIDNew)
+
+## actually multiple gbs can correspond to one accession
+card.sb.df <- card.sb %>%
+  select(SampleID, Family, Count) %>% #### are you sure the `Count` is the `RPKM`
+  spread(Family, Count, fill=0)
+card.sb.mat <- df_2_mat(card.sb.df, "SampleID")
+card.sb.mat <- t(card.sb.mat)
+```
+
+```{r}
+cts <- card.sb.mat
+cts.df <- cts %>%
+  melt(c("Family", "SampleID"), value.name="RPKM") %>%
+  separate(Family, into=c("ext","genbank","ARO Accession","ShortBRED_Category"), sep="\\|", remove=F) %>%
+  select(-ext) %>% 
+  mutate(`ARO Accession` = sub("_",":", `ARO Accession`)) %>%
+  mutate(Family = as.character(Family)) %>%
+  mutate(SampleID = as.character(SampleID))
+```
+
+# CARD database
+
+"The best way to think about resistance for this study is probably to think about which **drugs** the **resistance genes** *confer resistance to* AND group by the **AR genes** and **drugs class**."
+
+```{r}
+library(RJSONIO)
+library(ontologyIndex)
+library(ontologySimilarity)
+
+card.fp <- "card/card_20180628"
+
+aro.csv <- read_delim(file.path(card.fp, "card-ontology/aro.csv"), delim="\t")
+aro.index <- read_delim(file.path(card.fp, "card-data/aro_index.csv"), delim="\t")
+
+#### `aro_category` only contains category for the fasta sequences
+####  reflect AMR gene family, target drug class, and mechanism of resistance
+aro.category <- read_delim(file.path(card.fp, "card-data/aro_categories.csv"), delim="\t")
+
+# cross reference with genbank
+aro.category.index <- read_delim(file.path(card.fp, "card-data/aro_categories_index.csv"), delim="\t") %>%
+  unique()
+
+aro <- aro.category.index %>%
+  left_join(aro.index, by=c("Protein Accession","DNA Accession")) %>%
+  select(`ARO Accession`, everything())
+
+#### read in the ontology 
+card_obo_fp <- file.path(card.fp, "card-ontology/aro.obo")
+ont.obo <- get_ontology(card_obo_fp, extract_tags = "everything")
+
+aro.toadd <- aro %>% 
+  select(`ARO Accession`, `ARO Name`, `AMR Gene Family`, `Drug Class`, `Resistance Mechanism`) %>% 
+  unique()
+
+cts.df %<>% left_join(aro.toadd, by=c("ARO Accession"))
+```
+
+## which **drugs** the **resistance genes** *confer resistance to*
+
+```{r gene_resist_drug}
+## ARO gene => confer resistanct to ARO drug
+confer_resistance_to <- function (ARO.gene){
+  #ARO.gene <- "ARO:3000190"
+  arodrugs <- propagate_relations(ont.obo, ARO.gene, relations = "confers_resistance_to_drug", 
+                             use_inverse_relations = F, exclude_roots = T)
+  drugs <- bind_rows(lapply(1:length(arodrugs), function(x) {
+    aro.csv %>% filter(Accession %in% arodrugs[x]) %>% select(Accession:Name)
+  }))
+  
+  if (nrow(drugs) > 0){
+    drugs %>% dplyr::rename(ResistantToDrug = Name) %>% dplyr::rename(ResistantToARODrug = Accession)
+  } else {
+    data.frame(ResistantToARODrug = NA, ResistantToDrug = NA, stringsAsFactors = FALSE)
+  }
+}
+
+arogenes <- unique(cts.df$`ARO Accession`)
+drugs <- list()
+for (arogene in arogenes){
+  drugs[[arogene]] <- data.frame(AROgene = arogene, confer_resistance_to(arogene), stringsAsFactors = FALSE)
+}
+
+gene_resist_drug <- do.call(rbind, drugs)
+rownames(gene_resist_drug) <- NULL
+```
+
+```{r drug_to_drugclass}
+### ARO_ResistantToDrug => DrugName
+drugs <- paste(gene_resist_drug %>% filter(! is.na(ResistantToARODrug)) %>% .$ResistantToARODrug, collapse = ",")
+drugs <- unique(strsplit(drugs, ",")[[1]])
+drugclass <- list()
+for (arodrug in drugs){
+  #print(arodrug)
+  ans <- get_term_property(ont.obo, property="ancestors", term=arodrug, as_names=TRUE)
+  ## we subset the ontology data with already parsed/known category
+  ## miss case 1: ARO:3004021
+  ARO.drug.class <- lapply(1:length(names(ans)), function(x) aro.category %>% filter(grepl(names(ans)[x], `ARO Accession`))) %>% do.call(rbind, .)
+  ## miss case 2: ARO:0000014 (antibiotic mixture), the drug clss is 2 levels above antibiotic
+  if (nrow(ARO.drug.class) == 0 && length(ans) == 4) {
+    ARO.drug.class <- data.frame(`ARO Cagetory` = "Drug Class", 
+                                 `ARO Accession` = names(ans[length(ans)-1]),
+                                 `ARO Name` = paste(as.character(ans[length(ans)-1]),"*", sep =""))
+    colnames(ARO.drug.class) <- c("ARO Cagetory", "ARO Accession", "ARO Name")
+  } ## else print("My guess is wrong, which is only abx mixtures sometimes don't have a antibiotics class")
+  
+  drugclass[[arodrug]] <- data.frame(ResistantToARODrug = arodrug, ResistantToARODrugClass = ARO.drug.class$`ARO Accession`, ResistantToDrugClass = ARO.drug.class$`ARO Name`, stringsAsFactors = FALSE)
+}
+drug_to_drugclass <- do.call(rbind, drugclass)
+rownames(drug_to_drugclass) <- NULL
+
+### 20181105 actually we want to keep the all the unique records
+drug_to_drugclass %>%
+  group_by(ResistantToARODrug) %>%
+  filter(n() > 1) %>%
+  pander(caption = "one drug belongs to multiple drug classes")
+```
+
+```{r}
+print(nrow(gene_resist_drug))
+gene_resist_drug %<>%
+  left_join(drug_to_drugclass, by="ResistantToARODrug") 
+print(nrow(gene_resist_drug))
+```
+
+## the DrugClass each Drug belongs to
+
+```{r}
+drugclass_to_drug <- gene_resist_drug %>%
+  filter(! is.na(ResistantToARODrug)) %>% 
+  select(ResistantToDrug, ResistantToDrugClass) %>% 
+  unique() %>%
+  group_by(ResistantToDrug, ResistantToDrugClass) %>%
+  count() %>%
+  spread(ResistantToDrugClass, n, fill=0)
+```
+
+## group by the **AR genes** and **drug class**
+
+- **antibiotics categories**: to which a gene *confers resistance to* (e.g. macrolides, beta lacmases, or aminoglycosides).
+- **antibiotic group**: ARM gene
+
+- **most AR genes have (drug) class specific effects**. This is consistent with the infant resistome paper
+
+```{r}
+print("\n")
+print("The number of AR genes that don't have information about the drug it confers resistance to")
+print(gene_resist_drug %>% filter(is.na(ResistantToARODrug)) %>% nrow())
+
+gene_resist_drug_raw <- gene_resist_drug
+gene_resist_drug %<>% filter(! is.na(ResistantToARODrug))
+
+print("The number of unique drugs the AR genes confers resistance to")
+print(length(unique(gene_resist_drug$ResistantToDrug)))
+
+print("The number of unique drug classes the AR genes confers resistance to")
+print(length(unique(gene_resist_drug$ResistantToDrugClass)))
+
+#### get the ARO gene name for the AROgene accession
+gene_resist_drug %<>% left_join(aro.toadd, by=c("AROgene" = "ARO Accession"))
+```
+
+### what kind of antibiotics the patients take
+
+- vancomycin and cefepime (mutation model): not homolog model 
+
+```{r, fig.width = 15, fig.height = 6}
+yue.abxusage <- yue %>%
+  mutate(SampleIDnew = paste(SubjectID, study_group, redcap_event_name, sep=".")) %>%
+  mutate(SampleIDnew = sub("Subj ", "s", SampleIDnew)) %>% 
+  filter(! is.na(medications)) %>%
+  separate_rows(medications, sep=";", convert=FALSE) %>%
+  separate_rows(medications, sep="and", convert=FALSE) %>%
+  mutate(medications = sub(" ", "", medications)) %>%
+  select(SampleID, SampleIDnew, SubjectID, redcap_event_name, study_group, study_group_sub, antibiotics, medications, nonhost, Active_Colitis, Responded)
+
+drug_drugclass_1106 <- gene_resist_drug %>% 
+  select(ResistantToARODrug, ResistantToDrug, ResistantToARODrugClass, ResistantToDrugClass) %>%
+  unique()
+
+yue.abxusage %<>%
+  mutate(medications = sub(" ", "", medications)) %>%
+  mutate(medications = tolower(medications)) %>%
+  left_join(drug_drugclass_1106, by=c("medications" = "ResistantToDrug"))
+
+nah <- yue.abxusage %>% 
+  select(SampleIDnew, study_group, redcap_event_name, medications, ResistantToDrugClass) %>%
+  unique() %>%
+  group_by(SampleIDnew) %>% 
+  count(medications) %>% 
+  ungroup() %>%
+  spread(medications, n, fill=NA) %>%
+  gather(medications, count, amoxicillin:vancomycin) %>% 
+  separate(SampleIDnew, into=c("SubjectID", "study_group", "redcap_event_name"), sep="\\.", remove=F) %>% 
+  select(SubjectID, study_group, medications, count) %>%
+  unique() %>% 
+  ggplot(aes(SubjectID, medications, fill=count)) +
+  geom_tile(color="grey80", size=0.4) +
+  viridis::scale_fill_viridis(na.value="white", option = "A", direction = 1, guide=FALSE) +
+  theme_classic() +
+  ggtitle("medication usage for different study groups") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  theme(
+      axis.line = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.x = element_blank(), 
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    labs(
+      y="medications",
+      fill="Presence"
+    ) +
+  ggplot2::theme(aspect.ratio = 1.2) +
+  facet_grid( ~ study_group, scales = "free", space="free")
+
+################drug class
+yue.abxusage %>% 
+  select(SampleIDnew, study_group, redcap_event_name, medications, ResistantToDrugClass) %>%
+  unique() %>%
+  group_by(SampleIDnew) %>% 
+  count(ResistantToDrugClass) %>% 
+  ungroup() %>%
+  spread(ResistantToDrugClass, n, fill=NA) %>% 
+  gather(ResistantToDrugClass, count, `diaminopyrimidine antibiotic`:`tetracycline antibiotic`) %>% 
+  separate(SampleIDnew, into=c("SubjectID", "study_group", "redcap_event_name"), sep="\\.", remove=F) %>% 
+  select(SubjectID, study_group, ResistantToDrugClass, count) %>%
+  unique() %>% 
+  ggplot(aes(SubjectID, ResistantToDrugClass, fill=count)) +
+  geom_tile(color="grey80", size=0.4) +
+  viridis::scale_fill_viridis(na.value="white", option = "A", direction = 1, guide=FALSE) +
+  theme_classic() +
+  ggtitle("ResistantToDrugClass for different study groups") +
+  theme(plot.title = element_text(hjust = 0.5))  +
+  theme(
+      axis.line = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.x = element_blank(), 
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    labs(
+      y="ResistantToDrugClass",
+      fill="Presence"
+    ) +
+  ggplot2::theme(aspect.ratio = 1.2) +
+  facet_grid( ~ study_group, scales = "free", space="free")  +
+  ggsave("20181227_drug_usages.pdf", width = 10, height = 2, useDingbats=F)
+```
+
+## show time
+
+### total RPKM per sample
+
+```{r, fig.width=12, fig.height=5}
+##### we say it's RPKM, then let's get the total RPKM/counts (20181105)
+ctsColSum <- colSums(cts)
+by.sample <- data.frame(SampleID = names(ctsColSum), totalRPKM = ctsColSum, stringsAsFactors = FALSE)
+
+toPlot <- yue %>%
+  left_join(by.sample, by=c("SampleIDNew" = "SampleID"))
+
+toPlot %>%
+  ggplot(aes(x = study_group, y = totalRPKM, color = study_group)) +
+  geom_boxplot(coef = 10000) +
+  geom_quasirandom() +
+  theme_bw() +
+  scale_color_aaas() +
+  scale_y_log10() +
+  labs(y = "total RPKM (log 10 scale)") +
+  theme(
+      axis.line = element_blank(),
+      axis.text.x = element_blank(), 
+      axis.title.x = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+  ggtitle("total antibiotics resistance genes from ShortBRED") +
+  facet_wrap( ~ redcap_event_name)
+
+library(nlme)
+toTest <- yue %>% left_join(by.sample, by=c("SampleIDNew" = "SampleID"))
+#lmer(totalRPKM ~  status * Response.1009 + (1|SubjectID), data = toTest) %>% summary()
+
+logit <- function (p) log(p / (1 - p))
+my.mod <- summary(lme(totalRPKM ~ study_group * redcap_event_name, random=~1|SubjectID, data=toTest))
+data.frame(term  = rownames(my.mod$tTable), my.mod$tTable, row.names=NULL) %>%
+  filter(p.value <= 0.1) %>% 
+  pander(split.table=Inf) 
+```
+
+## heatmap by ARO gene family (antibiotics group) 
+
+- filter by totalRPKM >= 50
+
+    - can we increase the filter threshold?
+
+- at least showed up in two samples (so that we can compute the correlation coefficients later on)
+
+```{r}
+#### first thing !!!
+setdiff(yue$SampleIDNew, colnames(cts))
+cts <- cts[, yue$SampleIDNew, drop=FALSE]
+
+cts <- cts[!rowSums(cts) == 0, , drop=FALSE]
+
+rows_to_keep <- apply(cts,1,max) >= 50
+cts <- cts[rows_to_keep,]
+
+## for correlation, that gene has to show up in at least two samples, OTHERWISE, correlation is NA
+#rows_to_keep <- filter_low_coverage(rpkm.mat, perc_cutoff=0.25)
+num_nonzero <- function (x) sum(x > 0)
+rows_to_remove <- apply(cts, 1, num_nonzero) < 2
+print(sum(rows_to_remove))
+cts <- cts[!rows_to_remove, , drop=FALSE]
+
+toplot <- cts.df %>%
+  filter(Family %in% rownames(cts)) %>%
+  mutate(RPKM = log(RPKM, 2)) %>%
+  left_join(yue, by=c("SampleID" = "SampleIDNew"))
+```
+
+okay, the way to *group* the resistance genes, is to do the cluster, the heatmap!
+
+```{r, fig.height=9, fig.width=7}
+arogenes <- unique(toplot$`ARO Accession`)
+
+to.plot <- gene_resist_drug %>% 
+  select(AROgene, `ARO Name`, ResistantToDrugClass) %>% 
+  dplyr::rename(AROname = "ARO Name") %>%
+  filter(AROgene %in% arogenes)
+genes.in <- unique(to.plot$AROgene)
+genes.out <- setdiff(arogenes, genes.in)
+### ofc there is missing data
+to.plot.na <- toplot %>% 
+  filter(`ARO Accession` %in% genes.out) %>% 
+  select(`ARO Accession`, `ARO Name`) %>% 
+  unique() %>%
+  dplyr::rename(AROgene = "ARO Accession", AROname = "ARO Name") %>%
+  mutate(ResistantToDrugClass = "Unknown")
+to.plot <- rbind(to.plot, to.plot.na)
+
+gene_drug_df <- to.plot %>% group_by(AROname, ResistantToDrugClass) %>% count() %>% spread(ResistantToDrugClass, n, fill=0)
+gene_drug_mat <- df_2_mat(gene_drug_df, "AROname")
+
+# cluster and order matrix
+row.order <- hclust(dist(gene_drug_mat))$order # clustering
+col.order <- hclust(dist(t(gene_drug_mat)))$order
+dat_new <- gene_drug_mat[row.order, col.order] # re-order matrix accoring to clustering
+
+gene.order.by.drugclass <- rownames(gene_drug_mat)[row.order]
+
+# melt to dataframe
+df_molten_dat <- reshape2::melt(as.matrix(dat_new)) # reshape into dataframe
+names(df_molten_dat)[c(1:3)] <- c("AROname", "ResistantToDrugClass", "Count")
+
+nah <- df_molten_dat %>%
+  mutate(Presence = ifelse(Count > 0, 1, NA)) %>%
+  ggplot(aes(ResistantToDrugClass, AROname, fill=Presence)) +
+  geom_tile(color="grey80", size=0.4) +
+  viridis::scale_fill_viridis(na.value="white", option = "A", direction = 1, guide=FALSE) +
+  theme_classic() +
+  theme(
+      axis.line = element_blank(),
+      panel.border = element_blank(),
+      axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+      axis.title.x = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    labs(
+      x = "ResistantToDrugClass",
+      y="ARO Name",
+      fill="Presence"
+    ) +
+  coord_equal()
+
+
+############################################
+### for science, let's to the aro.toadd also
+aro.gene.to.drugclass.df <- aro.toadd %>% 
+  select(`ARO Accession`, `Drug Class`) %>%
+  unique() %>% 
+  group_by(`ARO Accession`) %>%
+  separate_rows(`Drug Class`, sep = ";", convert = FALSE) %>%
+  ungroup() %>%
+  group_by(`ARO Accession`, `Drug Class`) %>%
+  count() %>%
+  ungroup() %>%
+  spread(`Drug Class`, n, fill=0)
+aro.gene.to.drugclass.mat <- df_2_mat(aro.gene.to.drugclass.df, "ARO Accession")
+
+aro.toplot <- aro.gene.to.drugclass.mat[rownames(aro.gene.to.drugclass.mat) %in% arogenes, , drop=FALSE]
+aro.toplot <- aro.toplot[, colSums(aro.toplot)>0, drop=FALSE]
+
+# cluster and order matrix
+row.order <- hclust(dist(aro.toplot))$order # clustering
+col.order <- hclust(dist(t(aro.toplot)))$order
+dat_new <- aro.toplot[row.order, col.order] # re-order matrix accoring to clustering
+
+aro.order.by.drugclass <- rownames(aro.toplot)[row.order]
+gene.order.by.drugclass <- aro %>% 
+  select(`ARO Accession`, `ARO Name`) %>% 
+  filter(`ARO Accession` %in% aro.order.by.drugclass) %>%
+  mutate(`ARO Accession`= factor(`ARO Accession`, levels=aro.order.by.drugclass)) %>%
+  mutate(`ARO Name` = factor(`ARO Name`, levels=.$`ARO Name`))
+gene.order.by.drugclass <- levels(gene.order.by.drugclass$`ARO Name`)
+
+# melt to dataframe
+df_molten_dat <- reshape2::melt(as.matrix(dat_new)) # reshape into dataframe
+names(df_molten_dat)[c(1:3)] <- c("AROaccession", "ResistantToDrugClass", "Count")
+
+df_molten_dat %>%
+  mutate(Presence = ifelse(Count > 0, 1, NA)) %>% 
+  left_join(aro.toadd, by=c("AROaccession"  = "ARO Accession")) %>% 
+  dplyr::rename(AROname = "ARO Name") %>%
+  ggplot(aes(ResistantToDrugClass, AROname, fill=Presence)) +
+  geom_tile(color="grey80", size=0.4) +
+  viridis::scale_fill_viridis(na.value="white", option = "A", direction = 1, guide=FALSE) +
+  theme_classic() +
+  theme(
+      axis.line = element_blank(),
+      panel.border = element_blank(),
+      axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+      axis.title.x = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    labs(
+      x = "ResistantToDrugClass",
+      y="ARO Name",
+      fill="Presence"
+    ) +
+  coord_equal() +
+  #ggplot2::theme(aspect.ratio = 1.1) +
+  ggsave("20181227_aro_drugclass.pdf", width = 8, height = 7, useDingbats=F)
+## okay this is better
+```
+
+```{r, fig.width=13, fig.height=19}
+toplot %>%
+  #filter(redcap_event_name %in% "Baseline Visit") %>%
+  dplyr::rename(AROname = "ARO Name") %>% 
+  mutate(AROname = factor(AROname, levels=gene.order.by.drugclass)) %>% 
+  arrange(AROname) %>%
+  ggplot(aes(x = SubjectID, y = AROname, fill = RPKM)) + 
+  geom_tile(color="grey80", size=0.4) +
+  viridis::scale_fill_viridis(na.value="white", option = "A", name="log2(RPKM)", direction = -1) +
+  theme_classic() +
+  theme(
+    axis.line = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+    axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    y="ARO gene",
+    fill="Counts"
+  ) + 
+  facet_grid(redcap_event_name ~ study_group, scales = "free", space="free") +
+  ggplot2::theme(aspect.ratio = 1.2) +
+  ggsave("20181227_aro_heatmap.pdf", width = 13, height = 19, useDingbats=F)
+```
